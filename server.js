@@ -18,7 +18,23 @@ require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
+const Database = require('better-sqlite3');
 const app = express();
+
+// ── SQLite: post log ──────────────────────────────────────
+const db = new Database(path.join(__dirname, 'solar-logs.db'));
+db.exec(`
+  CREATE TABLE IF NOT EXISTS posts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_time TEXT NOT NULL,
+    text       TEXT NOT NULL,
+    author     TEXT NOT NULL,
+    post_time  TEXT NOT NULL,
+    verdict    TEXT NOT NULL DEFAULT 'kept',
+    logged_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+  )
+`);
+console.log('[sqlite] DB ready');
 const PORT = process.env.PORT || 3000;
 
 // ── Bluesky authentication state ──────────────────────────
@@ -460,69 +476,35 @@ function preScreenPosts(rawPosts) {
   return results;
 }
 
-// ── Airtable: track already-logged posts to avoid duplicates
-// In-memory set; resets on server restart, but that's acceptable
-// since the table is primarily used for archival review.
+// ── SQLite: track already-logged posts to avoid duplicates
+// In-memory set mirrors what's in the DB for the current process lifetime.
 const loggedTexts = new Set();
 
-// ── Airtable: log kept posts (one row per post) ───────────
+// ── SQLite: log kept posts ────────────────────────────────
 // Called after Gemini filtering to record which posts were displayed.
-// Sends records in batches of 10 to comply with the Airtable API limit.
-// Silently skips if credentials are missing.
-async function logToAirtable(sentPosts, keptIndices) {
-  const token = process.env.AIRTABLE_TOKEN;
-  const baseId = process.env.AIRTABLE_BASE_ID;
-  if (!token || !baseId) return;
-
+// Synchronous — better-sqlite3 transactions are blocking but fast (<1ms).
+function logToSQLite(sentPosts, keptIndices) {
   const keptSet = new Set(keptIndices);
-  // Only log posts that Gemini kept AND that haven't been logged this session
+  const batchTime = new Date().toISOString();
+
   const keptPosts = sentPosts
     .filter((_, i) => keptSet.has(i))
     .filter(p => !loggedTexts.has(p.text));
+
   if (keptPosts.length === 0) return;
 
-  const batchTime = new Date().toISOString();
+  const insert = db.prepare(
+    'INSERT INTO posts (batch_time, text, author, post_time, verdict) VALUES (?, ?, ?, ?, ?)'
+  );
 
-  // Airtable allows max 10 records per request — send in batches
-  const BATCH_SIZE = 10;
-  let logged = 0;
-
-  for (let i = 0; i < keptPosts.length; i += BATCH_SIZE) {
-    const batch = keptPosts.slice(i, i + BATCH_SIZE);
-    try {
-      const response = await fetch(`https://api.airtable.com/v0/${baseId}/GeminiLog`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          records: batch.map(p => ({
-            fields: {
-              'Batch Time': batchTime,
-              'Text': p.text,
-              'Author': p.author,
-              'Post Time': p.time,
-              'Verdict': 'kept'
-            }
-          }))
-        })
-      });
-
-      if (!response.ok) {
-        const err = await response.text();
-        console.warn(`[airtable] Log failed ${response.status}: ${err.substring(0, 200)}`);
-        break; // Stop on first batch error to avoid flooding with failures
-      }
-      batch.forEach(p => loggedTexts.add(p.text)); // Mark as logged
-      logged += batch.length;
-    } catch (err) {
-      console.warn('[airtable] Log error:', err.message);
-      break;
+  db.transaction(posts => {
+    for (const p of posts) {
+      insert.run(batchTime, p.text, p.author, p.time, 'kept');
+      loggedTexts.add(p.text);
     }
-  }
+  })(keptPosts);
 
-  if (logged > 0) console.log(`[airtable] ✓ Logged ${logged} kept posts`);
+  console.log(`[sqlite] ✓ Logged ${keptPosts.length} kept posts`);
 }
 
 // ── Gemini: semantic filter ────────────────────────────────
@@ -608,8 +590,8 @@ Reply with ONLY a JSON array of the numbers to KEEP, e.g. [1, 3, 7]. No explanat
     const filtered = posts.filter((_, i) => keepSet.has(i));
     console.log(`[gemini] ✓ Filtering complete — kept ${filtered.length}/${posts.length} posts`);
 
-    // Log to Airtable fire-and-forget — errors here should not block the API response
-    logToAirtable(posts, keptIndices).catch(() => {});
+    // Log to SQLite — synchronous, errors must not block the API response
+    try { logToSQLite(posts, keptIndices); } catch (e) { console.warn('[sqlite] Log error:', e.message); }
 
     return filtered;
   } catch (err) {
@@ -766,6 +748,80 @@ app.get('/api/bluesky/search', async (req, res) => {
   }
 });
 
+// ── Admin: post log viewer ────────────────────────────────
+// Protected by REFRESH_TOKEN (same pattern as /api/refresh).
+// Visit: /admin/logs?token=YOUR_REFRESH_TOKEN
+app.get('/admin/logs', (req, res) => {
+  const secret = process.env.REFRESH_TOKEN;
+  if (secret && req.query.token !== secret) {
+    return res.status(401).send('<h3 style="font-family:sans-serif;padding:2rem">Unauthorized — add ?token= to the URL</h3>');
+  }
+
+  const limit = Math.min(parseInt(req.query.limit) || 500, 2000);
+  const posts  = db.prepare('SELECT * FROM posts ORDER BY id DESC LIMIT ?').all(limit);
+  const total  = db.prepare('SELECT COUNT(*) as n FROM posts').get().n;
+  const today  = db.prepare("SELECT COUNT(*) as n FROM posts WHERE logged_at >= strftime('%Y-%m-%dT00:00:00Z', 'now')").get().n;
+  const authors = db.prepare('SELECT COUNT(DISTINCT author) as n FROM posts').get().n;
+
+  const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  const rows = posts.map(p => {
+    const loggedDate = new Date(p.logged_at);
+    const loggedStr  = loggedDate.toLocaleString('en-GB', { timeZone: 'UTC', dateStyle: 'short', timeStyle: 'short' }) + ' UTC';
+    const postDate   = new Date(p.post_time);
+    const postStr    = isNaN(postDate) ? p.post_time : postDate.toLocaleString('en-GB', { timeZone: 'UTC', dateStyle: 'short', timeStyle: 'short' }) + ' UTC';
+    return `<tr>
+      <td class="text-cell">${esc(p.text)}</td>
+      <td class="author">${esc(p.author)}</td>
+      <td class="time">${postStr}</td>
+      <td class="time">${loggedStr}</td>
+    </tr>`;
+  }).join('');
+
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Solar — Post Log</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #080808; color: #d8cfc0; font-family: Georgia, serif; font-size: 14px; padding: 40px 32px; }
+    h1 { font-size: 16px; font-weight: normal; letter-spacing: 0.12em; text-transform: uppercase; color: #f5a623; margin-bottom: 6px; }
+    .subtitle { font-size: 12px; color: #555; margin-bottom: 32px; }
+    .stats { display: flex; gap: 0; margin-bottom: 36px; border: 1px solid #1e1e1e; border-radius: 6px; overflow: hidden; }
+    .stat { flex: 1; padding: 20px 24px; border-right: 1px solid #1e1e1e; text-align: center; }
+    .stat:last-child { border-right: none; }
+    .stat-value { font-size: 32px; color: #f5a623; font-family: 'Helvetica Neue', sans-serif; font-weight: 300; }
+    .stat-label { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: #555; margin-top: 6px; }
+    table { width: 100%; border-collapse: collapse; }
+    thead th { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: #555; padding: 0 12px 12px; text-align: left; border-bottom: 1px solid #1e1e1e; }
+    td { padding: 14px 12px; border-bottom: 1px solid #111; vertical-align: top; }
+    tr:hover td { background: #0e0e0e; }
+    .text-cell { line-height: 1.6; max-width: 520px; color: #ccc5b5; }
+    .author { color: #f5a623; font-size: 12px; white-space: nowrap; padding-right: 24px; }
+    .time { color: #444; font-size: 11px; white-space: nowrap; font-family: 'Helvetica Neue', monospace; }
+    .footer { margin-top: 24px; text-align: center; color: #333; font-size: 11px; }
+    .footer a { color: #555; }
+  </style>
+</head>
+<body>
+  <h1>Solar — Post Log</h1>
+  <p class="subtitle">Bluesky posts kept by Gemini and displayed in the installation</p>
+  <div class="stats">
+    <div class="stat"><div class="stat-value">${total.toLocaleString()}</div><div class="stat-label">Total logged</div></div>
+    <div class="stat"><div class="stat-value">${today.toLocaleString()}</div><div class="stat-label">Today</div></div>
+    <div class="stat"><div class="stat-value">${authors.toLocaleString()}</div><div class="stat-label">Unique authors</div></div>
+  </div>
+  <table>
+    <thead><tr><th>Post</th><th>Author</th><th>Posted</th><th>Logged</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  <p class="footer">Showing ${posts.length} of ${total.toLocaleString()} posts · <a href="?token=${req.query.token || ''}&limit=2000">show more</a></p>
+</body>
+</html>`);
+});
+
 // ── Serve static files AFTER api routes ──────────────────────
 // Order matters: API routes above take priority over anything in /public
 app.use(express.static(path.join(__dirname, 'public')));
@@ -779,15 +835,6 @@ app.listen(PORT, async () => {
   loadCacheFromDisk();
   scheduleDailyRefresh();
   blueskyAccessToken = await authenticateBluesky();
-
-  // Confirm Airtable credentials are present
-  const atToken = process.env.AIRTABLE_TOKEN;
-  const atBase = process.env.AIRTABLE_BASE_ID;
-  if (atToken && atBase) {
-    console.log(`[airtable] Configured — base: ${atBase.substring(0, 6)}...${atBase.slice(-4)}, token: ${atToken.substring(0, 6)}...`);
-  } else {
-    console.warn('[airtable] No credentials — logging disabled');
-  }
 
   // Bluesky access tokens expire after ~2 hours — refresh every 90 minutes
   // to stay ahead of expiry without interrupting live requests
