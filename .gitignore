@@ -10,6 +10,9 @@ node_modules/
 .DS_Store
 Thumbs.db
 
+# Local Notes
+DROPLET-HANDOVER.md
+
 # Logs
 *.log
 npm-debug.log*
